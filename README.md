@@ -17,9 +17,10 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
+│   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -29,6 +30,7 @@
 ├── tests/
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
+│   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -41,8 +43,22 @@
 
 ## 快速开始（Docker Compose，推荐）
 
+前置条件：已安装 Docker Engine 20.10+ 与 Docker Compose v2
+（`docker compose version` 可输出版本号；旧版 Compose v1 请把下文
+`docker compose` 替换为 `docker-compose`）。
+
+### 构建并启动
+
 ```bash
+# 前台启动（构建镜像 + 启动容器，日志直接输出到终端，Ctrl-C 停止）
 docker compose up --build
+
+# 或后台启动（守护进程方式）
+docker compose up --build -d
+
+# 查看后台运行状态 / 日志
+docker compose ps
+docker compose logs -f
 ```
 
 服务启动后监听 **`http://localhost:8000`**：
@@ -54,8 +70,51 @@ docker compose up --build
 | Swagger 文档  | http://localhost:8000/docs            |
 | OpenAPI JSON  | http://localhost:8000/openapi.json    |
 
+容器内置健康检查（每 10s 访问 `/health`，连续 5 次失败标记为
+`unhealthy`），可通过 `docker compose ps` 的 `STATUS` 列确认服务就绪。
+
+快速验证：
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+
+### 数据持久化
+
 SQLite 数据文件位于容器内 `/app/data/schema_compat.db`，通过命名卷
-`schema_compat_data` 持久化，容器重建后历史报告仍在。
+`schema_compat_data` 持久化，容器重建（`up --build`）后历史报告与画像
+仍在。Docker 会给卷名加上 Compose 项目名前缀（默认是目录名，实际卷名
+形如 `schema-compat_schema_compat_data`）：
+
+```bash
+# 查看实际卷名与挂载位置
+docker volume ls | grep schema_compat
+docker volume inspect "$(docker volume ls -q | grep schema_compat)"
+
+# 停止容器（保留数据卷）
+docker compose down
+
+# 停止并删除数据卷（⚠️ 清空全部分析 / 画像历史）
+docker compose down -v
+```
+
+### 不使用 Compose，直接用 Docker
+
+```bash
+# 构建镜像
+docker build -t schema-compat-api .
+
+# 运行容器（8000 端口映射 + 数据卷持久化）
+docker run -d --name schema-compat-api \
+  -p 8000:8000 \
+  -v schema_compat_data:/app/data \
+  schema-compat-api
+
+# 查看日志 / 停止
+docker logs -f schema-compat-api
+docker stop schema-compat-api && docker rm schema-compat-api
+```
 
 ---
 
@@ -685,6 +744,120 @@ curl http://localhost:8000/api/analyses/1/profiles
   ]
 }
 ```
+
+### `POST /api/analyses/{id}/replay` — 样本回放诊断
+
+对一批**分析样本之外**的真实文档（最多 **5000** 个，支持对象 / 数组 /
+数字 / 字符串 / `null` 等任意 JSON 类型），分别用分析记录保存的**旧版
+与新版 schema** 逐个校验，按结果把文档分成互斥的四类，并把单向失败的
+校验错误**归因到该分析报告中已有的 issue**（按 `direction + path + code`
+匹配）。接口为**纯只读**操作：不修改分析报告、不追加画像快照、不写任何
+历史；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段        | 类型    | 必填 | 说明                                          |
+| ----------- | ------- | ---- | --------------------------------------------- |
+| `documents` | any[]   | 是   | 待回放的 JSON 文档列表，数量 1..5000（任意类型） |
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/replay \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"status": "pending"},
+    {"status": "active"},
+    {"status": "active", "owner": "alice"},
+    42
+  ]}'
+```
+
+**文档分类**（`counts`，四类互斥且总和等于文档总数）：
+
+| 分类            | 判定条件                    | 含义                                   |
+| --------------- | --------------------------- | -------------------------------------- |
+| `backward`      | 旧版合法、**新版拒绝**      | 命中向后不兼容的实锤样本               |
+| `forward`       | 新版合法、**旧版拒绝**      | 命中向前不兼容的实锤样本               |
+| `valid`         | 两版均合法                  | 与本次 schema 演进无关的正常数据       |
+| `invalid_both`  | **两版均拒绝**              | 无法归因于演进：脏数据或两版共有约束   |
+
+响应：
+
+```json
+{
+  "analysis_id": 1,
+  "total_documents": 4,
+  "counts": { "valid": 1, "backward": 2, "forward": 0, "invalid_both": 1 },
+  "issue_hits": [
+    {
+      "direction": "backward",
+      "path": "#",
+      "code": "required_added",
+      "severity": "error",
+      "count": 2,
+      "example_indices": [0, 1]
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/status",
+      "code": "enum_value_removed",
+      "severity": "error",
+      "count": 1,
+      "example_indices": [0]
+    }
+  ],
+  "unattributed": [
+    {
+      "direction": "both",
+      "reason": "rejected_by_both",
+      "pointer": "#",
+      "validator": "type",
+      "schema_pointer": "#/type",
+      "message": "值的类型必须为 object",
+      "count": 1,
+      "example_indices": [3]
+    }
+  ]
+}
+```
+
+响应字段：
+
+| 字段                            | 说明                                                         |
+| ------------------------------- | ------------------------------------------------------------ |
+| `issue_hits[]`                  | 报告中**每一条** issue 的命中情况，顺序与报告 issues 一致；未命中 `count=0` |
+| `issue_hits[].count`            | 命中该 issue 的文档数（每文档对同一 issue 最多计一次，一篇文档可同时命中多条 issue） |
+| `issue_hits[].example_indices`  | 示例文档下标（基于提交顺序，从 0 开始，升序，最多保留 20 个） |
+| `unattributed[]`                | **无法归因**到报告 issue 的校验错误分组                      |
+| `unattributed[].reason`         | `no_matching_issue`（单向失败但报告无对应 issue）或 `rejected_by_both`（两版都拒绝） |
+| `unattributed[].direction`      | `backward` / `forward` / `both`                              |
+| `unattributed[].pointer`        | 失败所在的 schema 节点位置（JSON Pointer，根为 `#`）         |
+| `unattributed[].validator`      | jsonschema 规则名（`required` / `type` / `minimum` / `oneOf` …）或 `false` |
+| `unattributed[].count`          | 命中该错误的文档数；`example_indices` 同为有界升序下标       |
+
+#### 归因规则
+
+- 值约束类错误（`type` / `minimum` / `enum` / `minItems` …）映射到
+  触发关键字所属的 **schema 节点**路径（去掉 `absolute_schema_path`
+  末段关键字），再映射到对应 issue code（如 `minimum` →
+  `minimum_increased`，`enum` → `enum_value_removed` / `enum_added`，
+  同一规则的多个候选 code 按报告中实际存在者命中）；
+- `required` / `additionalProperties` 的关键字写在容器节点上，直接定位到
+  容器（如根级必填缺失 → `#`）；同一位置同一 code 因**规则主体**不同
+  （如同时新增两个根级必填字段）而存在多条 issue 时，按缺失字段名 /
+  额外键名区分归因；
+- `oneOf` / `anyOf` 的嵌套错误树递归展开到叶子；分析器只在组合节点上报
+  分支不兼容，因此分支内的任何叶子失败都归因到组合节点的
+  `oneOf/anyOf_branch_missing / _branch_rejected / _added` issue；
+- 子 schema 为 `false` 时 jsonschema 的错误不带路径，引擎在 `$ref`
+  预解析后的 schema 与文档上并行下钻定位真正声明 false 的节点
+  （归因到 `schema_forbids_all`）；
+- 创建分析时随 `samples` 产生的 `sample_rejected_by_new/old` issue 使用
+  **实例位置**（如 `#/arr`），仅在失败实例位置精确一致时作为兜底归因；
+- 归因不到任何报告 issue 的单向失败（分析器未覆盖的关键字、启发式未
+  落成结构 issue 等）进入 `unattributed`（`no_matching_issue`），不做
+  跨节点的模糊回退，避免错误归因。
+
+入参为空列表、超过 5000 个文档或缺少 `documents` 字段时返回 `422`。
 
 ### `GET /health`
 

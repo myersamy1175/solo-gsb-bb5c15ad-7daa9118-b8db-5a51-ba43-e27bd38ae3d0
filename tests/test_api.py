@@ -669,3 +669,154 @@ def test_profile_cross_analysis_id_is_404(client):
     # 画像属于 a1，用 a2 的命名空间访问 -> 404
     resp = client.get(f"/api/analyses/{a2['id']}/profiles/{created['id']}")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/replay 样本回放诊断
+# ---------------------------------------------------------------------------
+
+REPLAY_OLD = {
+    "type": "object",
+    "properties": {"status": {"type": "string", "enum": ["active", "disabled", "pending"]}},
+}
+REPLAY_NEW = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["active", "disabled"]},
+        "owner": {"type": "string"},
+    },
+    "required": ["status", "owner"],
+}
+
+
+def _replay_analysis(client):
+    return _create(client, REPLAY_OLD, REPLAY_NEW, "replay-case")
+
+
+def test_replay_classifies_and_attributes_hits(client):
+    analysis = _replay_analysis(client)
+    documents = [
+        {"status": "pending"},                    # 0 旧合法新拒绝 -> enum + required(owner)
+        {"status": "active"},                     # 1 旧合法新拒绝 -> required(owner)
+        {"status": "active", "owner": "me"},      # 2 两版合法
+        42,                                       # 3 两版都拒绝 -> invalid_both
+        "bad",                                    # 4 两版都拒绝 -> invalid_both
+    ]
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": documents})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["analysis_id"] == analysis["id"]
+    assert data["total_documents"] == 5
+    assert data["counts"] == {
+        "valid": 1, "backward": 2, "forward": 0, "invalid_both": 2,
+    }
+
+    hits = {(h["direction"], h["path"], h["code"]): h for h in data["issue_hits"]}
+    enum_hit = hits[("backward", "#/properties/status", "enum_value_removed")]
+    assert enum_hit["count"] == 1
+    assert enum_hit["example_indices"] == [0]
+    # doc0 与 doc1 都缺少 owner（同一文档对同一 issue 仅计一次）
+    required_hit = hits[("backward", "#", "required_added")]
+    assert required_hit["count"] == 2
+    assert required_hit["example_indices"] == [0, 1]
+
+    # 报告中的每条 issue 都会输出（未命中 count=0）
+    assert len(data["issue_hits"]) == len(analysis["report"]["issues"])
+
+    # 两版都拒绝的文档进入 unattributed
+    both = data["unattributed"]
+    assert all(u["reason"] == "rejected_by_both" and u["direction"] == "both"
+               for u in both)
+    root_type = [u for u in both if u["pointer"] == "#" and u["validator"] == "type"]
+    assert root_type and root_type[0]["count"] == 2
+    assert root_type[0]["example_indices"] == [3, 4]
+
+
+def test_replay_forward_direction(client):
+    # 旧版必填 email、新版删除 -> 新版合法文档被旧版拒绝（forward）
+    old = {"type": "object", "required": ["email"],
+           "properties": {"email": {"type": "string"}}}
+    new = {"type": "object", "properties": {"email": {"type": "string"}}}
+    analysis = _create(client, old, new)
+
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": [{"email": "a@b.c"}, {}]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["counts"] == {
+        "valid": 1, "backward": 0, "forward": 1, "invalid_both": 0,
+    }
+    hit = [h for h in data["issue_hits"] if h["count"] == 1]
+    assert len(hit) == 1
+    assert hit[0]["direction"] == "forward"
+    assert hit[0]["path"] == "#"
+    assert hit[0]["code"] == "required_added"
+
+
+def test_replay_accepts_non_object_documents(client):
+    # 与画像接口不同：回放接受任意 JSON 类型文档
+    analysis = _replay_analysis(client)
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": [1, "str", None, True, [], {"status": "x"}]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_documents"] == 6
+    assert data["counts"]["invalid_both"] + data["counts"]["backward"] \
+        + data["counts"]["forward"] + data["counts"]["valid"] == 6
+
+
+def test_replay_does_not_modify_analysis_or_profiles(client):
+    analysis = _replay_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+
+    resp = client.post(base + "/replay", json={"documents": [
+        {"status": "pending"}, {"status": "active"}, 42,
+    ]})
+    assert resp.status_code == 200
+
+    after = client.get(base).json()
+    assert after["report"] == analysis["report"]
+    assert after["old_schema"] == analysis["old_schema"]
+    assert after["new_schema"] == analysis["new_schema"]
+    assert after["samples"] == analysis["samples"]
+
+    # 回放不产生任何画像快照
+    assert client.get(base + "/profiles").json()["total"] == 0
+
+    # 多次回放结果一致（无持久化副作用）
+    again = client.post(base + "/replay",
+                        json={"documents": [{"status": "pending"}]}).json()
+    assert again["counts"]["backward"] == 1
+
+
+def test_replay_validation_errors(client):
+    analysis = _replay_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/replay"
+
+    # 空列表 -> 422
+    assert client.post(base, json={"documents": []}).status_code == 422
+    # 5001 个文档 -> 422
+    assert client.post(base, json={"documents": [{}] * 5001}).status_code == 422
+    # 缺少 documents 字段 -> 422
+    assert client.post(base, json={}).status_code == 422
+
+
+def test_replay_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/replay", json={"documents": [{}]})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"
+
+
+def test_replay_after_profile_still_readonly(client):
+    analysis = _replay_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+
+    # 先写一张画像，再回放；画像快照数量与内容不受回放影响
+    profile_resp = client.post(base + "/profile",
+                               json={"documents": [{"status": "active", "owner": "me"}]})
+    assert profile_resp.status_code == 201
+    client.post(base + "/replay", json={"documents": [{"status": "pending"}] * 3})
+    listing = client.get(base + "/profiles").json()
+    assert listing["total"] == 1
+    assert listing["items"][0]["total_documents"] == 1

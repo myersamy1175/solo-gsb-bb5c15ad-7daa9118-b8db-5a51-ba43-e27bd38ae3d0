@@ -4,6 +4,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from app.profile import MAX_PROFILE_DOCUMENTS
+from app.replay import MAX_REPLAY_DOCUMENTS
 
 
 class AnalysisCreate(BaseModel):
@@ -314,3 +315,72 @@ class ProfileListResponse(BaseModel):
     analysis_id: int
     total: int
     items: list[ProfileSummary]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/replay 样本回放诊断
+# ---------------------------------------------------------------------------
+
+
+class ReplayRequest(BaseModel):
+    """POST /api/analyses/{id}/replay 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_REPLAY_DOCUMENTS,
+        description=(
+            f"待回放的 JSON 文档列表（任意 JSON 类型），数量 1..{MAX_REPLAY_DOCUMENTS}"
+        ),
+    )
+
+
+class ReplayCounts(BaseModel):
+    """回放文档按校验结果的分类计数（四类互斥，总和为文档总数）。"""
+
+    valid: int = Field(..., description="旧、新两版 schema 均校验通过的文档数")
+    backward: int = Field(..., description="旧版合法、新版拒绝（向后破坏实锤）的文档数")
+    forward: int = Field(..., description="新版合法、旧版拒绝（向前破坏实锤）的文档数")
+    invalid_both: int = Field(..., description="旧、新两版均拒绝（无法归因）的文档数")
+
+
+class ReplayIssueHit(BaseModel):
+    """报告中一条 issue 在回放样本上的命中情况。"""
+
+    direction: Literal["backward", "forward"]
+    path: str
+    code: str
+    severity: Literal["error", "warning"]
+    count: int = Field(..., ge=0, description="命中该 issue 的文档数（每文档每 issue 仅计一次）")
+    example_indices: list[int] = Field(
+        ..., description="示例文档下标（基于提交顺序，从 0 开始，升序且有界）"
+    )
+
+
+class ReplayUnattributedError(BaseModel):
+    """无法归因到报告 issue 的校验错误（按方向 / 位置 / 规则归并）。"""
+
+    direction: Literal["backward", "forward", "both"] = Field(
+        ..., description="失败方向：单向失败但无匹配 issue，或 both（两版均拒绝）"
+    )
+    reason: Literal["no_matching_issue", "rejected_by_both"]
+    pointer: str = Field(..., description="失败所在的 schema 节点位置（JSON Pointer）")
+    validator: str = Field(..., description="jsonschema 校验规则名（如 required / type）")
+    schema_pointer: str = Field(..., description="schema 中触发规则的实际位置（JSON Pointer）")
+    message: str = Field(..., description="确定性的规则说明（不随实例取值变化）")
+    count: int = Field(..., ge=0, description="命中该错误的文档数（每文档同类错误仅计一次）")
+    example_indices: list[int]
+
+
+class ReplayResponse(BaseModel):
+    """样本回放诊断结果（接口只读，不持久化）。"""
+
+    analysis_id: int
+    total_documents: int = Field(..., ge=0)
+    counts: ReplayCounts
+    issue_hits: list[ReplayIssueHit] = Field(
+        ..., description="报告全部 issue 的命中情况，按报告内 issue 顺序排列（未命中 count=0）"
+    )
+    unattributed: list[ReplayUnattributedError] = Field(
+        ..., description="无法归因到报告 issue 的校验错误分组"
+    )
