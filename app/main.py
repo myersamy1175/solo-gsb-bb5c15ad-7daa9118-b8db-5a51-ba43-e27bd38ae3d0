@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, gate, profile, sarif
+from app import compat, compare, gate, profile, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -21,6 +21,8 @@ from app.schemas import (
     ProfileCreate,
     ProfileListResponse,
     ProfileResponse,
+    ReplayCreate,
+    ReplayResponse,
 )
 
 
@@ -160,6 +162,23 @@ def evaluation_gate(analysis_id: int, payload: GateRequest, db: Session = Depend
     )
     return {"passed": result["pass"], "counts": result["counts"],
             "blocking": result["blocking"], "exempted": result["exempted"]}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/replay",
+    response_model=ReplayResponse,
+    tags=["analyses"],
+    summary="样本回放：用旧/新 schema 批量校验文档并归因到报告 issue",
+)
+def replay_analysis(analysis_id: int, payload: ReplayCreate, db: Session = Depends(get_db)):
+    # 只读回放：只读取已保存的 schema 与报告做校验归因，
+    # 绝不修改分析记录，也不写入画像历史。
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    return replay.replay_samples(
+        row.old_schema, row.new_schema, row.report, payload.documents
+    )
 
 
 @app.get(

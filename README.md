@@ -17,9 +17,10 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
+│   ├── replay.py        # 样本回放引擎（旧/新双 schema 校验 + 失败按 path/code 归因到报告 issue）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -31,6 +32,7 @@
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
+│   ├── test_replay.py   # 样本回放引擎单元测试（方向分类 / issue 归因 / 未归因）
 │   └── test_api.py      # 接口端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
@@ -41,9 +43,27 @@
 
 ## 快速开始（Docker Compose，推荐）
 
+前置条件：安装 **Docker Engine 20.10+** 与 **Docker Compose v2**
+（`docker compose version` 能正常输出版本即可；旧版独立的
+`docker-compose` v1 需把下文命令替换为 `docker-compose`）。
+
+在项目根目录（含 `docker-compose.yml`）执行：
+
 ```bash
+# 构建镜像并在前台启动（可直接看到 uvicorn 日志，Ctrl+C 停止）
 docker compose up --build
+
+# 或后台启动
+docker compose up --build -d
+
+# 查看日志 / 停止 / 重新构建
+docker compose logs -f
+docker compose down
+docker compose up --build -d
 ```
+
+首次启动会自动构建镜像（安装 `requirements.txt` 中的依赖）并在容器内
+初始化 SQLite 表结构；之后改动 `app/` 代码需重新执行 `--build` 才会进入镜像。
 
 服务启动后监听 **`http://localhost:8000`**：
 
@@ -54,8 +74,52 @@ docker compose up --build
 | Swagger 文档  | http://localhost:8000/docs            |
 | OpenAPI JSON  | http://localhost:8000/openapi.json    |
 
+健康检查通过后再发起请求：
+
+```bash
+curl -fsS http://localhost:8000/health   # {"status":"ok"}
+```
+
 SQLite 数据文件位于容器内 `/app/data/schema_compat.db`，通过命名卷
-`schema_compat_data` 持久化，容器重建后历史报告仍在。
+`schema_compat_data` 持久化，容器重建（`docker compose down` 后重新
+`up`）后历史报告仍在；只有显式删除卷（`docker compose down -v`）才会
+清空数据。
+
+### 不使用 Compose：直接用 Dockerfile
+
+也可以只用 Docker 构建 / 运行单容器（需自行管理端口、数据卷与环境变量）：
+
+```bash
+# 构建镜像
+docker build -t json-schema-compat-api .
+
+# 运行：映射 8000 端口，并用命名卷持久化 /app/data
+docker run -d --name schema-compat-api \
+  -p 8000:8000 \
+  -v schema_compat_data:/app/data \
+  json-schema-compat-api
+
+# 查看日志 / 健康检查 / 停止
+docker logs -f schema-compat-api
+curl -fsS http://localhost:8000/health
+docker stop schema-compat-api
+```
+
+如需把数据库放到宿主机指定目录，用绑定挂载替换命名卷即可：
+
+```bash
+docker run -d --name schema-compat-api -p 8000:8000 \
+  -v "$PWD/data:/app/data" json-schema-compat-api
+```
+
+数据库位置由环境变量 `DATABASE_URL` 控制（默认
+`sqlite:///./data/schema_compat.db`），可用 `-e` 覆盖：
+
+```bash
+docker run -d -p 8000:8000 \
+  -e DATABASE_URL="sqlite:///./data/custom.db" \
+  -v schema_compat_data:/app/data json-schema-compat-api
+```
 
 ---
 
@@ -685,6 +749,126 @@ curl http://localhost:8000/api/analyses/1/profiles
   ]
 }
 ```
+
+### `POST /api/analyses/{id}/replay` — 样本回放诊断
+
+对一份**已保存**的兼容性分析，提交 **1～5000** 个真实文档，分别用分析记录
+中的**旧版 / 新版 schema** 逐个校验，并按校验结果划分兼容方向：
+
+| 旧版校验 | 新版校验 | 分类 |
+| -------- | -------- | ---- |
+| 通过 | **失败** | `backward_failures`（向后回放失败） |
+| **失败** | 通过 | `forward_failures`（向前回放失败） |
+| 通过 | 通过 | `valid_documents` |
+| 失败 | 失败 | `invalid_under_both`（两版均拒绝） |
+
+方向明确的每条校验错误会**归因到该分析报告中已有的 issue**（以
+`direction + path + code` 精确定位）：由 jsonschema 规则触发位置推导
+受约束的 schema 节点（如 `.../minimum` → `#/properties/a`），按规则名
+映射 issue 代码（`required` → `required_added`、`minimum` →
+`minimum_increased`、`enum` → `enum_value_removed` / `enum_added` …），
+兼容 draft-04/06/07 列表形式 `items` 与 2019-09+ `prefixItems` 的路径
+别名、`additionalProperties:false` 以及布尔 `false` 子 schema
+（`schema_forbids_all`）；若结构性 issue 未命中，则再尝试归因到创建分析
+时由真实样例生成的 `sample_rejected_by_new/old` issue（按实例位置匹配）。
+
+接口为**纯只读**操作：只读取分析的两个 schema 与报告，**不会修改分析
+记录，也不会写入画像历史或任何其他数据**；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段        | 类型  | 必填 | 说明                                                  |
+| ----------- | ----- | ---- | ----------------------------------------------------- |
+| `documents` | any[] | 是   | 待回放 JSON 文档（可为任意 JSON 类型），数量 1..5000 |
+
+入参为空列表、缺字段或超过 5000 个文档时返回 `422`（与画像不同，回放
+不要求文档必须是 JSON 对象，字符串 / 数字 / 数组 / `null` 均可回放）。
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/replay \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"role": "viewer", "age": 1},
+    {"role": "admin", "age": -1},
+    {"role": "admin", "age": 3, "extra": true},
+    "totally-invalid"
+  ]}'
+```
+
+响应（节选）：
+
+```json
+{
+  "total_documents": 4,
+  "valid_documents": 0,
+  "backward_failures": 3,
+  "forward_failures": 0,
+  "invalid_under_both": 1,
+  "issue_hits": [
+    {
+      "direction": "backward",
+      "path": "#",
+      "code": "additional_properties_forbidden",
+      "severity": "error",
+      "message": "新版将 additionalProperties 设为 false，禁止额外字段",
+      "hit_count": 1,
+      "example_indices": [2]
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/role",
+      "code": "enum_value_removed",
+      "severity": "error",
+      "message": "枚举值 \"viewer\" 在新版中已被移除",
+      "hit_count": 1,
+      "example_indices": [0]
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/age",
+      "code": "minimum_increased",
+      "severity": "error",
+      "message": "新版下界收紧为 >= 0",
+      "hit_count": 1,
+      "example_indices": [1]
+    }
+  ],
+  "unattributed_failures": [
+    {
+      "fingerprint": "…",
+      "direction": null,
+      "pointer": "#",
+      "validator": "type",
+      "schema_pointer": "#/type",
+      "message": "值的类型必须为 object",
+      "count": 1,
+      "example_indices": [3]
+    }
+  ],
+  "document_results": [
+    {"index": 0, "valid_against_old": true, "valid_against_new": false,
+     "direction": "backward", "attributed_issue_count": 1,
+     "unattributed_error_count": 0}
+  ]
+}
+```
+
+响应字段：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `backward_failures` / `forward_failures` | 两个方向上的回放失败文档数 |
+| `valid_documents` / `invalid_under_both` | 两版均合法 / 均拒绝的文档数 |
+| `issue_hits[]` | 每条被命中的报告 issue 的统计，**按报告内 issue 原始顺序排列** |
+| `issue_hits[].hit_count` | 命中该 issue 的**文档数**（每个文档对同一条 issue 最多贡献一次） |
+| `issue_hits[].example_indices` | 示例文档下标（基于提交顺序，从 0 开始，升序且最多保留 20 个） |
+| `unattributed_failures[]` | **无法归因到任何报告 issue** 的校验错误，按稳定指纹（位置 + 规则 + 规则主体，SHA-256 前 16 位）归并，含命中次数与示例下标；`direction` 为 `backward` / `forward` / `null`（两版均拒绝时） |
+| `document_results[]` | 逐文档分类结果（下标、两版是否通过、方向、命中 issue 数、未归因错误数），下标与提交顺序一致 |
+
+回放只回答"报告里的这些破坏点，真实数据分别命中了多少次、是哪些文档"：
+若一条失败在报告中找不到对应的 (path, code) issue（例如两版共有的约束被
+违反，或分析引擎未覆盖的差异），它不会被强行塞入某个 issue，而是进入
+`unattributed_failures` 单独暴露。
 
 ### `GET /health`
 

@@ -4,6 +4,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from app.profile import MAX_PROFILE_DOCUMENTS
+from app.replay import MAX_REPLAY_DOCUMENTS
 
 
 class AnalysisCreate(BaseModel):
@@ -314,3 +315,79 @@ class ProfileListResponse(BaseModel):
     analysis_id: int
     total: int
     items: list[ProfileSummary]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/replay 样本回放诊断
+# ---------------------------------------------------------------------------
+
+
+class ReplayCreate(BaseModel):
+    """POST /api/analyses/{id}/replay 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_REPLAY_DOCUMENTS,
+        description=(
+            f"待回放的 JSON 文档列表（可为任意 JSON 类型），"
+            f"数量 1..{MAX_REPLAY_DOCUMENTS}"
+        ),
+    )
+
+
+class ReplayIssueHit(BaseModel):
+    """回放失败命中报告中的一条 issue 的统计。"""
+
+    direction: Literal["backward", "forward"]
+    path: str
+    code: str
+    severity: Literal["error", "warning"]
+    message: str
+    hit_count: int = Field(..., ge=0, description="命中该 issue 的文档数（每文档每 issue 仅计一次）")
+    example_indices: list[int] = Field(
+        ..., description="示例文档下标（基于提交顺序，从 0 开始，升序且有界）"
+    )
+
+
+class ReplayUnattributedFailure(BaseModel):
+    """无法归因到任何报告 issue 的校验失败（按稳定指纹归并）。"""
+
+    fingerprint: str = Field(..., description="稳定规则指纹（SHA-256 前 16 位）")
+    direction: Literal["backward", "forward"] | None = Field(
+        ..., description="失败方向；两版均拒绝的文档为 null"
+    )
+    pointer: str = Field(..., description="失败位置（JSON Pointer，最深公共失败路径）")
+    validator: str = Field(..., description="jsonschema 校验规则名（如 required / type）")
+    schema_pointer: str = Field(..., description="schema 中触发规则的位置（JSON Pointer）")
+    message: str = Field(..., description="确定性的失败说明（不随输入顺序变化）")
+    count: int = Field(..., ge=0, description="命中该问题的文档数（每文档每组仅计一次）")
+    example_indices: list[int]
+
+
+class ReplayDocumentResult(BaseModel):
+    """单个回放文档的分类结果（不含错误明细，明细见归因 / 未归因列表）。"""
+
+    index: int
+    valid_against_old: bool
+    valid_against_new: bool
+    direction: Literal["backward", "forward"] | None
+    attributed_issue_count: int = Field(..., ge=0)
+    unattributed_error_count: int = Field(..., ge=0)
+
+
+class ReplayResponse(BaseModel):
+    total_documents: int
+    valid_documents: int = Field(..., description="旧、新两版 schema 均校验通过的文档数")
+    backward_failures: int = Field(..., description="旧版合法、新版拒绝的文档数（向后回放失败）")
+    forward_failures: int = Field(..., description="新版合法、旧版拒绝的文档数（向前回放失败）")
+    invalid_under_both: int = Field(..., description="旧、新两版均拒绝的文档数")
+    issue_hits: list[ReplayIssueHit] = Field(
+        ..., description="按报告 issue（direction + path + code）归并的命中统计，按报告内 issue 顺序排列"
+    )
+    unattributed_failures: list[ReplayUnattributedFailure] = Field(
+        ..., description="无法归因到报告 issue 的校验失败"
+    )
+    document_results: list[ReplayDocumentResult] = Field(
+        ..., description="逐文档的分类结果，下标与提交顺序一致"
+    )

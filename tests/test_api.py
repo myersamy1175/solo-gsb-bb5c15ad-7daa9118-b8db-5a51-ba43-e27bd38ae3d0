@@ -669,3 +669,220 @@ def test_profile_cross_analysis_id_is_404(client):
     # 画像属于 a1，用 a2 的命名空间访问 -> 404
     resp = client.get(f"/api/analyses/{a2['id']}/profiles/{created['id']}")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/replay 样本回放诊断
+# ---------------------------------------------------------------------------
+
+REPLAY_OLD = {
+    "type": "object",
+    "properties": {
+        "role": {"type": "string", "enum": ["admin", "editor", "viewer"]},
+        "age": {"type": "integer"},
+    },
+}
+REPLAY_NEW = {
+    "type": "object",
+    "properties": {
+        "role": {"type": "string", "enum": ["admin", "editor"]},
+        "age": {"type": "integer", "minimum": 0},
+    },
+    "required": ["role"],
+    "additionalProperties": False,
+}
+
+
+def _replay_analysis(client):
+    return _create(client, REPLAY_OLD, REPLAY_NEW, "replay-case")
+
+
+def test_replay_classifies_and_attributes_hits(client):
+    analysis = _replay_analysis(client)
+    documents = [
+        {"role": "viewer", "age": 1},        # 0 backward: enum 移除
+        {"role": "admin", "age": -1},        # 1 backward: minimum 收紧
+        {"age": 9},                          # 2 backward: required_added
+        {"role": "admin", "age": 1, "x": 2}, # 3 两版均合法（旧版允许额外键）？
+        "not-an-object",                     # 4 两版均拒绝
+        {"role": "admin", "age": 1, "z": 1}, # 5 新拒绝(额外键)、旧合法 -> backward
+    ]
+    # 文档 3 携带额外键：旧版默认允许，但新版 additionalProperties=false 拒绝
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": documents})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_documents"] == 6
+    assert data["backward_failures"] == 5
+    assert data["forward_failures"] == 0
+    assert data["valid_documents"] == 0
+    assert data["invalid_under_both"] == 1
+
+    hits = {(h["direction"], h["path"], h["code"]): h for h in data["issue_hits"]}
+    enum_hit = hits[("backward", "#/properties/role", "enum_value_removed")]
+    assert enum_hit["hit_count"] == 1
+    assert enum_hit["example_indices"] == [0]
+    min_hit = hits[("backward", "#/properties/age", "minimum_increased")]
+    assert min_hit["example_indices"] == [1]
+    required_hit = hits[("backward", "#", "required_added")]
+    assert required_hit["example_indices"] == [2]
+    ap_hit = hits[("backward", "#", "additional_properties_forbidden")]
+    assert ap_hit["hit_count"] == 2
+    assert ap_hit["example_indices"] == [3, 5]
+
+    # 命中组全部带严重级别与报告内消息
+    assert all(h["severity"] in ("error", "warning") for h in data["issue_hits"])
+    assert all(h["hit_count"] >= 1 for h in data["issue_hits"])
+
+    # 未归因：两版均拒绝的字符串文档
+    unatt = data["unattributed_failures"]
+    assert any(u["direction"] is None and u["example_indices"] == [4]
+               for u in unatt)
+
+    # 逐文档分类结果
+    results = data["document_results"]
+    assert [r["index"] for r in results] == list(range(6))
+    assert results[0]["direction"] == "backward"
+    assert results[0]["valid_against_old"] is True
+    assert results[0]["valid_against_new"] is False
+    assert results[4]["direction"] is None
+    assert results[4]["valid_against_old"] is False
+    assert results[4]["attributed_issue_count"] == 0
+
+
+def test_replay_forward_direction_and_issue_mapping(client):
+    # 新版新增可选属性 c，旧版 additionalProperties=false：
+    # 带 c 的文档新合法、旧拒绝 -> forward，命中 property_no_longer_allowed
+    old = {"type": "object",
+           "properties": {"a": {"type": "string"}},
+           "additionalProperties": False}
+    new = {"type": "object",
+           "properties": {"a": {"type": "string"}, "c": {"type": "integer"}}}
+    analysis = _create(client, old, new)
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": [{"c": 3}]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["forward_failures"] == 1
+    assert data["backward_failures"] == 0
+    hit = data["issue_hits"][0]
+    assert hit["direction"] == "forward"
+    assert hit["example_indices"] == [0]
+
+    result = data["document_results"][0]
+    assert result["direction"] == "forward"
+    assert result["valid_against_new"] is True
+    assert result["valid_against_old"] is False
+
+
+def test_replay_all_valid_documents(client):
+    analysis = _replay_analysis(client)
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": [
+                           {"role": "admin", "age": 5},
+                           {"role": "editor", "age": 0},
+                       ]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["valid_documents"] == 2
+    assert data["backward_failures"] == 0
+    assert data["forward_failures"] == 0
+    assert data["invalid_under_both"] == 0
+    assert data["issue_hits"] == []
+    assert data["unattributed_failures"] == []
+    for result in data["document_results"]:
+        assert result["direction"] is None
+        assert result["attributed_issue_count"] == 0
+        assert result["unattributed_error_count"] == 0
+
+
+def test_replay_accepts_any_json_types(client):
+    # 回放入参不限制为对象（与画像不同）：字符串 / 数字 / 数组 / null 均合法
+    analysis = _replay_analysis(client)
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": ["x", 1, None, True, [1, 2]]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_documents"] == 5
+    assert data["invalid_under_both"] == 5
+
+
+def test_replay_does_not_modify_analysis_or_profiles(client):
+    analysis = _replay_analysis(client)
+    # 先写一版画像，回放后画像与分析都应保持不变
+    profile_resp = client.post(
+        f"/api/analyses/{analysis['id']}/profile",
+        json={"documents": [{"role": "admin", "age": 1}]})
+    assert profile_resp.status_code == 201
+    profile_before = profile_resp.json()
+
+    replay_resp = client.post(
+        f"/api/analyses/{analysis['id']}/replay",
+        json={"documents": [{"role": "viewer"}]})
+    assert replay_resp.status_code == 200
+
+    after = client.get(f"/api/analyses/{analysis['id']}").json()
+    assert after["report"] == analysis["report"]
+    assert after["old_schema"] == analysis["old_schema"]
+    assert after["new_schema"] == analysis["new_schema"]
+    assert after["samples"] == analysis["samples"]
+
+    # 画像快照数量与内容不变
+    listing = client.get(f"/api/analyses/{analysis['id']}/profiles").json()
+    assert listing["total"] == 1
+    latest = client.get(f"/api/analyses/{analysis['id']}/profile").json()
+    assert latest == profile_before
+
+
+def test_replay_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/replay",
+                       json={"documents": [{"role": "admin"}]})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"
+
+
+def test_replay_validation_errors(client):
+    analysis = _replay_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/replay"
+
+    # 空文档列表 -> 422
+    resp = client.post(base, json={"documents": []})
+    assert resp.status_code == 422
+
+    # 缺少 documents 字段 -> 422
+    resp = client.post(base, json={})
+    assert resp.status_code == 422
+
+    # 超过 5000 个文档 -> 422
+    resp = client.post(base, json={"documents": [{"role": "admin"}] * 5001})
+    assert resp.status_code == 422
+
+
+def test_replay_5000_documents_accepted(client):
+    analysis = _replay_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/replay"
+    resp = client.post(base, json={"documents": [
+        {"role": "admin", "age": 1}] * 5000})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_documents"] == 5000
+
+
+def test_replay_unattributed_failure_grouping(client):
+    # 两版 schema 完全一致：报告无 issue，违反共有约束的文档归入未归因
+    schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+    analysis = _create(client, schema, schema)
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay",
+                       json={"documents": [{"a": "x"}, {"a": "y"}]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["issue_hits"] == []
+    assert data["invalid_under_both"] == 2
+    groups = data["unattributed_failures"]
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["direction"] is None
+    assert group["pointer"] == "#/a"
+    assert group["validator"] == "type"
+    assert group["count"] == 2
+    assert group["example_indices"] == [0, 1]
+    assert len(group["fingerprint"]) == 16
